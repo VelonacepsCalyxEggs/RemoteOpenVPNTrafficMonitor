@@ -89,12 +89,12 @@ namespace RemoteOpenVPNTrafficMonitor
         {
             try
             {
-                SshCommand command = _sshClient.RunCommand("echo \"status 3\" | nc 127.0.0.1 7505");
+                using var command = _sshClient.RunCommand("echo \"status 3\" | nc 127.0.0.1 7505");
                 return command.Result;
             }
             catch
             {
-                SshCommand command = _sshClient.RunCommand("grep '^CLIENT_LIST' /var/log/openvpn-status.log");
+                using var command = _sshClient.RunCommand("grep '^CLIENT_LIST' /var/log/openvpn-status.log");
                 return command.Result;
             }
         }
@@ -241,6 +241,11 @@ namespace RemoteOpenVPNTrafficMonitor
 
         private void SetupSSHConnection(string hostname, int port, string username, string password)
         {
+            if (_sshClient != null)
+            {
+                if (_sshClient.IsConnected) _sshClient.Disconnect();
+                _sshClient.Dispose();
+            }
             _sshClient = new SshClient(hostname, port, username, password);
 
             try
@@ -249,7 +254,7 @@ namespace RemoteOpenVPNTrafficMonitor
                 _logger.LogInformation($"Connected to {hostname}. Server version: {_sshClient.ConnectionInfo.ServerVersion}");
 
                 // Test conn
-                SshCommand command = _sshClient.RunCommand("whoami");
+                using SshCommand command = _sshClient.RunCommand("whoami");
                 _logger.LogInformation($"Logged in as: {command.Result}");
             }
             catch (Exception ex)
@@ -264,8 +269,8 @@ namespace RemoteOpenVPNTrafficMonitor
             if (string.IsNullOrEmpty(connectionString))
                 throw new ArgumentException("Database connection string is not set!");
 
-            await using var dataSource = NpgsqlDataSource.Create(connectionString);
-            _dataSource = dataSource;
+            _dataSource?.Dispose();
+            _dataSource = NpgsqlDataSource.Create(connectionString);
 
             // Check if db exists
             await using var checkDbCommand = _dataSource.CreateCommand(
