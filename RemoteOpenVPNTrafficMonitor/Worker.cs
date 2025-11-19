@@ -130,10 +130,11 @@ namespace RemoteOpenVPNTrafficMonitor
             using var command = sshClient.RunCommand("tail /var/log/openvpn-status.log");
             return command.Result;
         }
-
+        
         private Dictionary<string, (string ipAddr, double throughputIn, double throughputOut)>
             ParseStatusAndCalculateThroughput(string statusOutput, ServerMonitoringState state)
         {
+            _logger.LogInformation(statusOutput);
             var results = new Dictionary<string, (string, double, double)>();
             var currentTime = DateTime.UtcNow;
 
