@@ -2,78 +2,45 @@ using Microsoft.Extensions.Logging;
 using Npgsql;
 using Renci.SshNet;
 using System.Collections.Concurrent;
+using static Microsoft.EntityFrameworkCore.DbLoggerCategory.Database;
 
 namespace RemoteOpenVPNTrafficMonitor
 {
     public class Worker : BackgroundService
     {
         private readonly ILogger<Worker> _logger;
-        private readonly IConfiguration _configuration;
-        private int _pollingInterval;
-        private SshClient? _sshClient;
-        private NpgsqlDataSource? _dataSource;
+        private readonly DatabaseManager _dbManager;
+        private readonly List<VPNServerConfig> _serverConfigs;
 
-        // Store previous readings for each client
-        private ConcurrentDictionary<string, ClientTrafficData> _previousReadings = new();
+        private readonly ConcurrentDictionary<string, ServerMonitoringState> _serverStates = new();
 
-        private struct ClientTrafficData
-        {
-            public long BytesIn;
-            public long BytesOut;
-            public DateTime Timestamp;
-            public string IpAddress;
-        }
-
-        public Worker(ILogger<Worker> logger, IConfiguration configuration)
+        public Worker(ILogger<Worker> logger, DatabaseManager dbManager, List<VPNServerConfig> serverConfigs)
         {
             _logger = logger;
-            _configuration = configuration;
+            _dbManager = dbManager;
+            _serverConfigs = serverConfigs;
         }
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
             try
             {
-                Startup();
-                await SetupDatabaseConnection();
+                _logger.LogInformation("Starting VPN Server Monitors...");
 
-                while (!stoppingToken.IsCancellationRequested)
+                foreach (var config in _serverConfigs)
                 {
-                    if (_sshClient == null || !_sshClient.IsConnected)
-                    {
-                        _logger.LogWarning("SSH client not connected. Attempting to reconnect...");
-                        Startup();
-                    }
-
-                    if (_sshClient != null && _sshClient.IsConnected)
-                    {
-                        try
-                        {
-                            var statusOutput = GetOpenVpnStatus();
-                            var clientThroughput = ParseStatusAndCalculateThroughput(statusOutput);
-
-                            foreach (var client in clientThroughput)
-                            {
-                                _logger.LogInformation(
-                                    $"Client: {client.Key}, " +
-                                    $"In: {client.Value.throughputIn} byte/s, " +
-                                    $"Out: {client.Value.throughputOut} byte/s");
-                            }
-
-                            await InsertDataToDb(clientThroughput);
-                        }
-                        catch (Exception ex)
-                        {
-                            _logger.LogError($"Error getting OpenVPN status: {ex.Message}");
-                        }
-                    }
-                    else
-                    {
-                        _logger.LogError("SSH client not connected after reconnect attempt.");
-                    }
-
-                    await Task.Delay(_pollingInterval * 1000, stoppingToken);
+                    await InitializeServer(config);
                 }
+
+                _logger.LogInformation("All VPN server monitors started.");
+
+                // Start monitoring tasks for all servers
+                var monitoringTasks = _serverConfigs
+                    .Select(config => MonitorServerAsync(config, stoppingToken))
+                    .ToList();
+
+                // wait for all monitoring tasks to complete
+                await Task.WhenAll(monitoringTasks);
             }
             catch (Exception ex)
             {
@@ -81,26 +48,91 @@ namespace RemoteOpenVPNTrafficMonitor
             }
             finally
             {
-                _sshClient?.Disconnect();
+                foreach (var state in _serverStates.Values)
+                {
+                    state.SshClient?.Disconnect();
+                    state.SshClient?.Dispose();
+                }
             }
         }
 
-        private string GetOpenVpnStatus()
+        private async Task InitializeServer(VPNServerConfig config)
         {
             try
             {
-                using var command = _sshClient.RunCommand("echo \"status 3\" | nc 127.0.0.1 7505");
-                return command.Result;
+                _logger.LogInformation("Initializing monitor for server {ServerName}...", config.Name);
+
+                ValidateServerConfig(config);
+
+                // store server state
+                var state = new ServerMonitoringState
+                {
+                    Config = config,
+                    PreviousReadings = new ConcurrentDictionary<string, ClientTrafficData>()
+                };
+
+                SetupSSHConnection(state);
+                await CreateTableForDB(config);
+
+                _serverStates[config.Name] = state;
+                _logger.LogInformation("Monitor for server {ServerName} initialized successfully.", config.Name);
             }
-            catch
+            catch (Exception ex)
             {
-                using var command = _sshClient.RunCommand("grep '^CLIENT_LIST' /var/log/openvpn-status.log");
-                return command.Result;
+                _logger.LogError(ex, "Failed to initialize server {ServerName}", config.Name);
             }
         }
 
+        private async Task MonitorServerAsync(VPNServerConfig config, CancellationToken stoppingToken)
+        {
+            var serverName = config.Name;
+
+            while (!stoppingToken.IsCancellationRequested)
+            {
+                try
+                {
+                    if (!_serverStates.TryGetValue(serverName, out var state))
+                    {
+                        _logger.LogWarning("No state found for server {ServerName}. Reinitializing...", serverName);
+                        await InitializeServer(config);
+                        await Task.Delay(5000, stoppingToken);
+                        continue;
+                    }
+
+                    if (state.SshClient == null || !state.SshClient.IsConnected)
+                    {
+                        _logger.LogWarning("SSH client for {ServerName} not connected. Attempting to reconnect...", serverName);
+                        SetupSSHConnection(state);
+                    }
+
+                    if (state.SshClient != null && state.SshClient.IsConnected)
+                    {
+                        var statusOutput = GetOpenVpnStatus(state.SshClient);
+                        var clientThroughput = ParseStatusAndCalculateThroughput(statusOutput, state);
+                        await InsertDataToDb(clientThroughput, config);
+                    }
+                    else
+                    {
+                        _logger.LogError("SSH client for {ServerName} not connected after reconnect attempt.", serverName);
+                    }
+
+                    await Task.Delay(config.PollingIntervalSeconds * 1000, stoppingToken);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error monitoring server {ServerName}", serverName);
+                    await Task.Delay(30000, stoppingToken);
+                }
+            }
+        }
+        private string GetOpenVpnStatus(SshClient sshClient)
+        {
+            using var command = sshClient.RunCommand("tail /var/log/openvpn-status.log");
+            return command.Result;
+        }
+
         private Dictionary<string, (string ipAddr, double throughputIn, double throughputOut)>
-            ParseStatusAndCalculateThroughput(string statusOutput)
+            ParseStatusAndCalculateThroughput(string statusOutput, ServerMonitoringState state)
         {
             var results = new Dictionary<string, (string, double, double)>();
             var currentTime = DateTime.UtcNow;
@@ -109,32 +141,30 @@ namespace RemoteOpenVPNTrafficMonitor
             {
                 if (line.StartsWith("CLIENT_LIST"))
                 {
-                    string[] parts = line.Split('\t'); // add custom delimiter support later
+                    string[] parts = line.Split(',');
 
                     if (parts.Length >= 7)
                     {
                         string clientName = parts[1];
-                        string ipAddr = parts[2].Split(':')[0]; // Extract IP without port
+                        string ipAddr = parts[2].Split(':')[0];
 
                         if (long.TryParse(parts[5], out long bytesIn) &&
                             long.TryParse(parts[6], out long bytesOut))
                         {
                             string clientKey = clientName;
 
-                            if (_previousReadings.TryGetValue(clientKey, out ClientTrafficData previous))
+                            if (state.PreviousReadings.TryGetValue(clientKey, out ClientTrafficData previous))
                             {
                                 double timeDiff = (currentTime - previous.Timestamp).TotalSeconds;
 
                                 if (timeDiff > 0)
                                 {
-                                    // Handle counter resets (negative values)
                                     long bytesInDiff = bytesIn;
                                     long bytesOutDiff = bytesOut;
 
                                     if (bytesIn < previous.BytesIn || bytesOut < previous.BytesOut)
                                     {
-                                        _logger.LogWarning($"Counter reset detected for {clientName}. Using absolute values.");
-                                        // For counter reset, use the current values as the difference
+                                        _logger.LogWarning($"Counter reset detected for {clientName} on server {state.Config.Name}. Using absolute values.");
                                     }
                                     else
                                     {
@@ -142,7 +172,6 @@ namespace RemoteOpenVPNTrafficMonitor
                                         bytesOutDiff = bytesOut - previous.BytesOut;
                                     }
 
-                                    // Calculate throughput in byte/s
                                     double throughputIn = bytesInDiff / timeDiff;
                                     double throughputOut = bytesOutDiff / timeDiff;
 
@@ -150,7 +179,7 @@ namespace RemoteOpenVPNTrafficMonitor
                                 }
                             }
 
-                            _previousReadings[clientKey] = new ClientTrafficData
+                            state.PreviousReadings[clientKey] = new ClientTrafficData
                             {
                                 BytesIn = bytesIn,
                                 BytesOut = bytesOut,
@@ -162,33 +191,30 @@ namespace RemoteOpenVPNTrafficMonitor
                 }
             }
 
-            // Clean up old entries to prevent memory leaks (scary)
-            CleanupOldEntries();
+            CleanupOldEntries(state);
 
             return results;
         }
 
-        private void CleanupOldEntries()
+        private void CleanupOldEntries(ServerMonitoringState state)
         {
             var cutoffTime = DateTime.UtcNow.AddHours(-1);
-            var oldKeys = _previousReadings
+            var oldKeys = state.PreviousReadings
                 .Where(kv => kv.Value.Timestamp < cutoffTime)
                 .Select(kv => kv.Key)
                 .ToList();
 
             foreach (var key in oldKeys)
             {
-                _previousReadings.TryRemove(key, out _);
+                state.PreviousReadings.TryRemove(key, out _);
             }
         }
 
-        private async Task InsertDataToDb(Dictionary<string, (string ipAddr, double throughputIn, double throughputOut)> results)
+        private async Task InsertDataToDb(
+            Dictionary<string, (string ipAddr, double throughputIn, double throughputOut)> results,
+            VPNServerConfig config)
         {
-            if (_dataSource == null)
-                throw new Exception("Database source is null.");
-
-            await using var conn = await _dataSource.OpenConnectionAsync();
-
+            using NpgsqlConnection conn = await _dbManager.GetConnection();
             try
             {
                 using var batch = new NpgsqlBatch(conn);
@@ -196,7 +222,7 @@ namespace RemoteOpenVPNTrafficMonitor
                 foreach (var client in results)
                 {
                     var cmd = new NpgsqlBatchCommand(
-                        "INSERT INTO traffic (client_name, ip_addr, bytes_in, bytes_out) VALUES ($1, $2, $3, $4)")
+                        $"INSERT INTO {config.Name} (client_name, ip_addr, bytes_in, bytes_out) VALUES ($1, $2, $3, $4)")
                     {
                         Parameters =
                         {
@@ -217,88 +243,79 @@ namespace RemoteOpenVPNTrafficMonitor
             }
         }
 
-        private void Startup()
+        private async Task CreateTableForDB(VPNServerConfig config)
         {
-            _pollingInterval = _configuration.GetValue<int>("PollingInterval");
-            string hostname = _configuration.GetValue<string>("vpnServerHostname");
-            int port = _configuration.GetValue<int>("vpnServerPort");
-            string username = _configuration.GetValue<string>("sshUsername");
-            string password = _configuration.GetValue<string>("sshPassword");
-
-            if (_pollingInterval < 1)
-                throw new ArgumentException("PollingInterval must be at least 1 second");
-            if (string.IsNullOrEmpty(hostname))
-                throw new ArgumentException("Hostname is not set!");
-            if (port < 1 || port > 65535)
-                throw new ArgumentException("Port must be a value between 1-65535");
-            if (string.IsNullOrEmpty(username))
-                throw new ArgumentException("Username must be set.");
-            if (string.IsNullOrEmpty(password))
-                throw new ArgumentException("Password must be set.");
-
-            SetupSSHConnection(hostname, port, username, password);
-        }
-
-        private void SetupSSHConnection(string hostname, int port, string username, string password)
-        {
-            if (_sshClient != null)
-            {
-                if (_sshClient.IsConnected) _sshClient.Disconnect();
-                _sshClient.Dispose();
-            }
-            _sshClient = new SshClient(hostname, port, username, password);
-
-            try
-            {
-                _sshClient.Connect();
-                _logger.LogInformation($"Connected to {hostname}. Server version: {_sshClient.ConnectionInfo.ServerVersion}");
-
-                // Test conn
-                using SshCommand command = _sshClient.RunCommand("whoami");
-                _logger.LogInformation($"Logged in as: {command.Result}");
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError($"SSH Setup error occurred: {ex.GetType().Name} {ex.Message}");
-            }
-        }
-
-        private async Task SetupDatabaseConnection()
-        {
-            var connectionString = _configuration.GetValue<string>("connectionString");
-            if (string.IsNullOrEmpty(connectionString))
-                throw new ArgumentException("Database connection string is not set!");
-
-            _dataSource?.Dispose();
-            _dataSource = NpgsqlDataSource.Create(connectionString);
-
-            // Check if db exists
-            await using var checkDbCommand = _dataSource.CreateCommand(
-                "SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = 'vpntraffic')");
-            bool exists = (bool)(await checkDbCommand.ExecuteScalarAsync() ?? false);
-
-            if (!exists)
-            {
-                await using var createDbCommand = _dataSource.CreateCommand("CREATE DATABASE vpntraffic");
-                await createDbCommand.ExecuteNonQueryAsync();
-            }
-
-            // connect to the vpntraffic db
-            var dbBuilder = new NpgsqlConnectionStringBuilder(connectionString)
-            {
-                Database = "vpntraffic"
-            };
-            _dataSource = NpgsqlDataSource.Create(dbBuilder.ConnectionString);
-
-            await using var createTableCommand = _dataSource.CreateCommand(@"
-                CREATE TABLE IF NOT EXISTS traffic (
+            using var conn = await _dbManager.GetConnection();
+            await using var createTableCommand = new NpgsqlCommand($@"
+                CREATE TABLE IF NOT EXISTS {config.Name} (
                     client_name VARCHAR(255) NOT NULL,
                     ip_addr VARCHAR(15) NOT NULL,
                     bytes_in BIGINT NOT NULL CHECK (bytes_in >= 0),
                     bytes_out BIGINT NOT NULL CHECK (bytes_out >= 0),
                     measured_at TIMESTAMP DEFAULT NOW()
-                )");
+                )", conn);
+
             await createTableCommand.ExecuteNonQueryAsync();
+        }
+
+        private void ValidateServerConfig(VPNServerConfig config)
+        {
+            if (config.PollingIntervalSeconds < 1)
+                throw new ArgumentException($"PollingInterval must be at least 1 second for server {config.Name}");
+            if (string.IsNullOrEmpty(config.Address))
+                throw new ArgumentException($"Hostname is not set for server {config.Name}!");
+            if (config.Port < 1 || config.Port > 65535)
+                throw new ArgumentException($"Port must be a value between 1-65535 for server {config.Name}");
+            if (string.IsNullOrEmpty(config.Username))
+                throw new ArgumentException($"Username must be set for server {config.Name}.");
+            if (string.IsNullOrEmpty(config.Password))
+                throw new ArgumentException($"Password must be set for server {config.Name}.");
+        }
+
+        private void SetupSSHConnection(ServerMonitoringState state)
+        {
+            var config = state.Config;
+
+            state.SshClient?.Disconnect();
+            state.SshClient?.Dispose();
+
+            _logger.LogInformation("Setting up SSH connection to {ServerName} at {Hostname}:{Port}...",
+                config.Name, config.Address, config.Port);
+
+            state.SshClient = new SshClient(config.Address, config.Port, config.Username, config.Password);
+
+            try
+            {
+                state.SshClient.Connect();
+                _logger.LogInformation("Connected to {ServerName}. Server version: {Version}",
+                    config.Name, state.SshClient.ConnectionInfo.ServerVersion);
+
+                // Test connection
+                using SshCommand command = state.SshClient.RunCommand("whoami");
+                _logger.LogInformation("Logged into {ServerName} as: {Username}", config.Name, command.Result.Trim());
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "SSH Setup error occurred for server {ServerName}", config.Name);
+                state.SshClient?.Dispose();
+                state.SshClient = null;
+            }
+        }
+
+        // Helper classes for server state management
+        private class ServerMonitoringState
+        {
+            public VPNServerConfig Config { get; set; } = null!;
+            public SshClient? SshClient { get; set; }
+            public ConcurrentDictionary<string, ClientTrafficData> PreviousReadings { get; set; } = null!;
+        }
+
+        private struct ClientTrafficData
+        {
+            public long BytesIn;
+            public long BytesOut;
+            public DateTime Timestamp;
+            public string IpAddress;
         }
     }
 }
