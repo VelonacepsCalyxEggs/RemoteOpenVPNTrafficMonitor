@@ -127,7 +127,7 @@ namespace RemoteOpenVPNTrafficMonitor
         }
         private string GetOpenVpnStatus(SshClient sshClient)
         {
-            using var command = sshClient.RunCommand("tail /var/log/openvpn-status.log");
+            using var command = sshClient.RunCommand("cat /var/log/openvpn-status.log");
             return command.Result;
         }
         
