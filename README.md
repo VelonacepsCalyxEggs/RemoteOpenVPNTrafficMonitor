@@ -78,10 +78,10 @@ You can (theoretically) have as many servers as you wish listed in secrets.
 The application automatically:
 - Checks for the existence of the `vpntraffic` database.
 - Creates the database if it doesn't exist.
-- Creates a `traffic` table with the following schema:
+- Creates a `[SERVER NAME]` table with the following schema:
 
 ```sql
-CREATE TABLE traffic (
+CREATE TABLE [SERVER NAME] (
     client_name VARCHAR(255) NOT NULL,
     ip_addr VARCHAR(15) NOT NULL,
     bytes_in BIGINT NOT NULL CHECK (bytes_in >= 0),
