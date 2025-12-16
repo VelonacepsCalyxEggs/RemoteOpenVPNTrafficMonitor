@@ -1,4 +1,4 @@
-# Remote OpenVPN Traffic Monitor
+# Remote OpenVPN/WireGuard Traffic Monitor
 
 A background service that monitors OpenVPN client traffic statistics by connecting to an OpenVPN and Wireguard server via SSH, parsing traffic data, and storing throughput metrics in a PostgreSQL database.
 
