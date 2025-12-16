@@ -1,8 +1,6 @@
-using Microsoft.Extensions.Logging;
 using Npgsql;
 using Renci.SshNet;
 using System.Collections.Concurrent;
-using static Microsoft.EntityFrameworkCore.DbLoggerCategory.Database;
 
 namespace RemoteOpenVPNTrafficMonitor
 {
@@ -144,7 +142,6 @@ namespace RemoteOpenVPNTrafficMonitor
         private string GetWireGuardStatus(SshClient sshClient)
         {
             using var command = sshClient.RunCommand("sudo wg show all dump | tail -n +2");
-            _logger.LogInformation(command.Result);
             return command.Result;
         }
 
@@ -155,9 +152,7 @@ namespace RemoteOpenVPNTrafficMonitor
 
             foreach (string line in statusOutput.Split('\n', StringSplitOptions.RemoveEmptyEntries))
             {
-                _logger.LogInformation($"{line}");
                 string[] parts = line.Split('\t', StringSplitOptions.RemoveEmptyEntries);
-                _logger.LogInformation($"{parts.Length}");
                 string clientName = parts[1];
                 string ipAddr = parts[3].Split(':')[0];
 
