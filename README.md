@@ -37,26 +37,36 @@ A background service that monitors OpenVPN client traffic statistics by connecti
    ```bash
    dotnet user-secrets init
    ```
+   I did not yet implement an ability to use certs, so... uh... passwords only for now!
 2. Set your secrets:
    ```bash
-   dotnet user-secrets set "vpnServerHostname" "your-vpn-server.com"
-   dotnet user-secrets set "vpnServerPort" "22"
-   dotnet user-secrets set "sshUsername" "your-ssh-username"
-   dotnet user-secrets set "vpnServerPassword" "your-ssh-password"
-   dotnet user-secrets set "connectionString" "Host=localhost;Username=postgres;Password=your-db-password"
+   "vpnServers": [
+       {
+         "Name": "Server 1",
+         "Address": "x.x.x.x",
+         "Port": 22,
+         "Username": "verycoolusername1",
+         "Password": "verystrongpassword1",
+         "PollingIntervalSeconds": 10
+       },
+       {
+         "Name": "Server N",
+         "Address": "x.x.x.x",
+         "Port": 22,
+         "Username": "verycoolusername2",
+         "Password": "verystrongpassword2",
+         "PollingIntervalSeconds": 10
+    }
+     ],
+     "dbConnectionString": "Host=x.x.x.x;Port=5432;Username=postgres;Password=veryverystrongpasswordorsomethingelse"
    ```
 
 ### Configuration Parameters
 
-- **PollingInterval**: Time in seconds between data collection cycles (minimum: 1)
-- **vpnServerHostname**: OpenVPN server hostname or IP address
-- **vpnServerPort**: SSH port number (default: 22)
-- **sshUsername**: SSH username for server authentication
-- **vpnServerPassword**: SSH password for server authentication
-- **connectionString**: PostgreSQL connection string
+- **PollingIntervalSeconds**: Time in seconds between data collection cycles (minimum: 1)
+You can (theoretically) have as many servers as you wish listed in secrets.
 
 ## Installation
-
 - Configure your secrets or environment variables as described above.
 - Run the service:
   ```bash
@@ -68,10 +78,10 @@ A background service that monitors OpenVPN client traffic statistics by connecti
 The application automatically:
 - Checks for the existence of the `vpntraffic` database.
 - Creates the database if it doesn't exist.
-- Creates a `traffic` table with the following schema:
+- Creates a `[SERVER NAME]` table with the following schema:
 
 ```sql
-CREATE TABLE traffic (
+CREATE TABLE [SERVER NAME] (
     client_name VARCHAR(255) NOT NULL,
     ip_addr VARCHAR(15) NOT NULL,
     bytes_in BIGINT NOT NULL CHECK (bytes_in >= 0),
@@ -83,12 +93,8 @@ CREATE TABLE traffic (
 ## How It Works
 
 1. **SSH Connection**: Establishes an SSH connection to the OpenVPN server.
-2. **Data Collection**: Retrieves OpenVPN status using either:
-    - The management interface:
-      ```bash
-      echo "status 3" | nc 127.0.0.1 7505
-      ```
-    - The status log file (`/var/log/openvpn-status.log`) as fallback.
+2. **Data Collection**: Retrieves OpenVPN status using:
+    - The status log file (`/var/log/openvpn-status.log`) via cat.
 3. **Throughput Calculation**: Computes throughput by comparing current and previous byte counts.
 4. **Data Storage**: Inserts calculated throughput values into PostgreSQL.
 5. **Cleanup**: Removes stale client entries older than 1 hour.
