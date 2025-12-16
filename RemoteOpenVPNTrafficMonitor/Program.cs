@@ -10,7 +10,7 @@ if (serverConfigs.Any())
     Console.WriteLine($"Found {serverConfigs.Count} VPN server configurations:");
     foreach (var config in serverConfigs)
     {
-        Console.WriteLine($"  - {config.Name} at {config.Address}:{config.Port}");
+        Console.WriteLine($"  - {config.Name} at {config.Address}:{config.Port} of type: {config.Type.ToString()}");
     }
 
     builder.Services.AddSingleton(serverConfigs);

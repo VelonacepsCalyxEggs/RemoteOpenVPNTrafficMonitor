@@ -107,8 +107,18 @@ namespace RemoteOpenVPNTrafficMonitor
 
                     if (state.SshClient != null && state.SshClient.IsConnected)
                     {
-                        var statusOutput = GetOpenVpnStatus(state.SshClient);
-                        var clientThroughput = ParseStatusAndCalculateThroughput(statusOutput, state);
+                        var statusOutput = state.Config.Type switch
+                        {
+                            VPNServerType.OPENVPN => GetOpenVpnStatus(state.SshClient),
+                            VPNServerType.WIREGUARD => GetWireGuardStatus(state.SshClient),
+                            _ => throw new ArgumentException(nameof(state.Config.Type))
+                        };
+                        var clientThroughput = state.Config.Type switch
+                        {
+                            VPNServerType.OPENVPN => ParseStatusAndCalculateThroughputOVPN(statusOutput, state),
+                            VPNServerType.WIREGUARD => ParseStatusAndCalculateThroughputWRG(statusOutput, state),
+                            _ => throw new ArgumentException(nameof(state.Config.Type))
+                        };
                         await InsertDataToDb(clientThroughput, config);
                     }
                     else
@@ -130,11 +140,75 @@ namespace RemoteOpenVPNTrafficMonitor
             using var command = sshClient.RunCommand("cat /var/log/openvpn-status.log");
             return command.Result;
         }
-        
-        private Dictionary<string, (string ipAddr, double throughputIn, double throughputOut)>
-            ParseStatusAndCalculateThroughput(string statusOutput, ServerMonitoringState state)
+
+        private string GetWireGuardStatus(SshClient sshClient)
         {
-            _logger.LogInformation(statusOutput);
+            using var command = sshClient.RunCommand("sudo wg show all dump | tail -n +2");
+            _logger.LogInformation(command.Result);
+            return command.Result;
+        }
+
+        private Dictionary<string, (string ipAddr, double throughputIn, double throughputOut)> ParseStatusAndCalculateThroughputWRG(string statusOutput, ServerMonitoringState state)
+        {
+            var results = new Dictionary<string, (string, double, double)>();
+            var currentTime = DateTime.UtcNow;
+
+            foreach (string line in statusOutput.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+            {
+                _logger.LogInformation($"{line}");
+                string[] parts = line.Split('\t', StringSplitOptions.RemoveEmptyEntries);
+                _logger.LogInformation($"{parts.Length}");
+                string clientName = parts[1];
+                string ipAddr = parts[3].Split(':')[0];
+
+                if (long.TryParse(parts[6], out long bytesIn) &&
+                                            long.TryParse(parts[7], out long bytesOut))
+                {
+                    string clientKey = clientName;
+
+                    if (state.PreviousReadings.TryGetValue(clientKey, out ClientTrafficData previous))
+                    {
+                        double timeDiff = (currentTime - previous.Timestamp).TotalSeconds;
+
+                        if (timeDiff > 0)
+                        {
+                            long bytesInDiff = bytesIn;
+                            long bytesOutDiff = bytesOut;
+
+                            if (bytesIn < previous.BytesIn || bytesOut < previous.BytesOut)
+                            {
+                                _logger.LogWarning($"Counter reset detected for {clientName} on server {state.Config.Name}. Using absolute values.");
+                            }
+                            else
+                            {
+                                bytesInDiff = bytesIn - previous.BytesIn;
+                                bytesOutDiff = bytesOut - previous.BytesOut;
+                            }
+
+                            double throughputIn = bytesInDiff / timeDiff;
+                            double throughputOut = bytesOutDiff / timeDiff;
+
+                            results[clientName] = (ipAddr, throughputIn, throughputOut);
+                        }
+                    }
+                    state.PreviousReadings[clientKey] = new ClientTrafficData
+                    {
+                        BytesIn = bytesIn,
+                        BytesOut = bytesOut,
+                        Timestamp = currentTime,
+                        IpAddress = ipAddr
+                    };
+                }
+            }
+            CleanupOldEntries(state);
+
+            return results;
+        }
+
+        private Dictionary<string, (string ipAddr, double throughputIn, double throughputOut)>
+            ParseStatusAndCalculateThroughputOVPN(string statusOutput, ServerMonitoringState state)
+        {
+            //_logger.LogInformation(statusOutput);
             var results = new Dictionary<string, (string, double, double)>();
             var currentTime = DateTime.UtcNow;
 
@@ -223,7 +297,7 @@ namespace RemoteOpenVPNTrafficMonitor
                 foreach (var client in results)
                 {
                     var cmd = new NpgsqlBatchCommand(
-                        $"INSERT INTO {config.Name} (client_name, ip_addr, bytes_in, bytes_out) VALUES ($1, $2, $3, $4)")
+                        $"INSERT INTO {config.Name} (client_name, ip_addr, client_upload, client_download) VALUES ($1, $2, $3, $4)")
                     {
                         Parameters =
                         {
@@ -251,8 +325,8 @@ namespace RemoteOpenVPNTrafficMonitor
                 CREATE TABLE IF NOT EXISTS {config.Name} (
                     client_name VARCHAR(255) NOT NULL,
                     ip_addr VARCHAR(15) NOT NULL,
-                    bytes_in BIGINT NOT NULL CHECK (bytes_in >= 0),
-                    bytes_out BIGINT NOT NULL CHECK (bytes_out >= 0),
+                    client_upload BIGINT NOT NULL CHECK (client_upload >= 0),
+                    client_download BIGINT NOT NULL CHECK (client_download >= 0),
                     measured_at TIMESTAMP DEFAULT NOW()
                 )", conn);
 
