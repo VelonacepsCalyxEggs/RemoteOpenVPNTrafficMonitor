@@ -1,6 +1,6 @@
-# Remote OpenVPN Traffic Monitor
+# Remote OpenVPN/WireGuard Traffic Monitor
 
-A background service that monitors OpenVPN client traffic statistics by connecting to an OpenVPN server via SSH, parsing traffic data, and storing throughput metrics in a PostgreSQL database.
+A background service that monitors OpenVPN client traffic statistics by connecting to an OpenVPN and Wireguard server via SSH, parsing traffic data, and storing throughput metrics in a PostgreSQL database.
 
 ## Features
 
@@ -44,6 +44,7 @@ A background service that monitors OpenVPN client traffic statistics by connecti
        {
          "Name": "Server 1",
          "Address": "x.x.x.x",
+         "Type": 0,
          "Port": 22,
          "Username": "verycoolusername1",
          "Password": "verystrongpassword1",
@@ -52,6 +53,7 @@ A background service that monitors OpenVPN client traffic statistics by connecti
        {
          "Name": "Server N",
          "Address": "x.x.x.x",
+         "Type": 1,
          "Port": 22,
          "Username": "verycoolusername2",
          "Password": "verystrongpassword2",
@@ -65,7 +67,7 @@ A background service that monitors OpenVPN client traffic statistics by connecti
 
 - **PollingIntervalSeconds**: Time in seconds between data collection cycles (minimum: 1)
 You can (theoretically) have as many servers as you wish listed in secrets.
-
+- **Type**: 0 for OpenVPN, 1 for WireGuard.
 ## Installation
 - Configure your secrets or environment variables as described above.
 - Run the service:
@@ -84,8 +86,8 @@ The application automatically:
 CREATE TABLE [SERVER NAME] (
     client_name VARCHAR(255) NOT NULL,
     ip_addr VARCHAR(15) NOT NULL,
-    bytes_in BIGINT NOT NULL CHECK (bytes_in >= 0),
-    bytes_out BIGINT NOT NULL CHECK (bytes_out >= 0),
+    client_upload BIGINT NOT NULL CHECK (bytes_in >= 0),
+    client_download BIGINT NOT NULL CHECK (bytes_out >= 0),
     measured_at TIMESTAMP DEFAULT NOW()
 );
 ```
