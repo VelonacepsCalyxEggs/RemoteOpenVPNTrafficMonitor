@@ -117,6 +117,7 @@ namespace RemoteOpenVPNTrafficMonitor
                             VPNServerType.WIREGUARD => ParseStatusAndCalculateThroughputWRG(statusOutput, state),
                             _ => throw new ArgumentException(nameof(state.Config.Type))
                         };
+                        if (clientThroughput == null) continue;
                         await InsertDataToDb(clientThroughput, config);
                     }
                     else
@@ -145,7 +146,7 @@ namespace RemoteOpenVPNTrafficMonitor
             return command.Result;
         }
 
-        private Dictionary<string, (string ipAddr, double throughputIn, double throughputOut)> ParseStatusAndCalculateThroughputWRG(string statusOutput, ServerMonitoringState state)
+        private Dictionary<string, (string ipAddr, double throughputIn, double throughputOut)>? ParseStatusAndCalculateThroughputWRG(string statusOutput, ServerMonitoringState state)
         {
             var results = new Dictionary<string, (string, double, double)>();
             var currentTime = DateTime.UtcNow;
@@ -155,7 +156,10 @@ namespace RemoteOpenVPNTrafficMonitor
                 string[] parts = line.Split('\t', StringSplitOptions.RemoveEmptyEntries);
                 string clientName = parts[1];
                 string ipAddr = parts[3].Split(':')[0];
-
+                if (ipAddr == string.Empty)
+                {
+                    return null;
+                }
                 if (long.TryParse(parts[6], out long bytesIn) &&
                                             long.TryParse(parts[7], out long bytesOut))
                 {
