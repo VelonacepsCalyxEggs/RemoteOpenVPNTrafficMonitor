@@ -139,6 +139,17 @@ namespace RemoteOpenVPNTrafficMonitor
 
                     await Task.Delay(config.PollingIntervalSeconds * 1000, stoppingToken);
                 }
+                catch (HttpRequestException ex)
+                {
+                    _logger.LogWarning(ex, "3X-UI cookie expireed for server {ServerName}... renewing.", serverName);
+                    if (!_serverStates.TryGetValue(serverName, out var state))
+                    {
+                        _logger.LogError("No state found for server {ServerName}. Reinitializing...", serverName);
+                        await InitializeServer(config);
+                        await Task.Delay(5000, stoppingToken);
+                    }
+                    else throw new ArgumentNullException(nameof(serverName));
+                }
                 catch (Exception ex)
                 {
                     _logger.LogError(ex, "Error monitoring server {ServerName}", serverName);
@@ -471,7 +482,6 @@ namespace RemoteOpenVPNTrafficMonitor
                 new KeyValuePair<string, string>("username", config.Username),
                 new KeyValuePair<string, string>("password", config.Password)
             });
-            _logger.LogInformation(state.HttpClient.BaseAddress.OriginalString);
             var loginResponse = await state.HttpClient.PostAsync("login", loginData);
             loginResponse.EnsureSuccessStatusCode();
         }
