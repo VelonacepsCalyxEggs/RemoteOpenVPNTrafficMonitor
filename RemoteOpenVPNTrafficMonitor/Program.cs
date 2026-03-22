@@ -1,7 +1,7 @@
 using RemoteOpenVPNTrafficMonitor;
 
 var builder = Host.CreateApplicationBuilder(args);
-Console.WriteLine("Starting Remote OpenVPN Traffic Monitor...");
+Console.WriteLine("Starting Remote VPN Traffic Monitor...");
 builder.Services.AddSingleton<DatabaseManager>();
 var serverConfigs = builder.Configuration.GetSection("vpnServers").Get<List<VPNServerConfig>>() ?? [];
 

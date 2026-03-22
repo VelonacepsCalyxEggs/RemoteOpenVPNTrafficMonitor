@@ -1,6 +1,10 @@
 using Npgsql;
 using Renci.SshNet;
 using System.Collections.Concurrent;
+using System.Net;
+using System.Net.Http.Headers;
+using System.Text.Json;
+using static Org.BouncyCastle.Math.EC.ECCurve;
 
 namespace RemoteOpenVPNTrafficMonitor
 {
@@ -68,8 +72,15 @@ namespace RemoteOpenVPNTrafficMonitor
                     Config = config,
                     PreviousReadings = new ConcurrentDictionary<string, ClientTrafficData>()
                 };
+                if (state.Config.Type != VPNServerType.XUI)
+                {
+                    SetupSSHConnection(state);
+                }
+                else
+                {
+                    await SetupHttpClient(state);
+                }
 
-                SetupSSHConnection(state);
                 await CreateTableForDB(config);
 
                 _serverStates[config.Name] = state;
@@ -97,24 +108,26 @@ namespace RemoteOpenVPNTrafficMonitor
                         continue;
                     }
 
-                    if (state.SshClient == null || !state.SshClient.IsConnected)
+                    if (state.Config.Type != VPNServerType.XUI && (state.SshClient == null || !state.SshClient.IsConnected))
                     {
                         _logger.LogWarning("SSH client for {ServerName} not connected. Attempting to reconnect...", serverName);
                         SetupSSHConnection(state);
                     }
 
-                    if (state.SshClient != null && state.SshClient.IsConnected)
+                    if (state.SshClient != null && state.SshClient.IsConnected || state.HttpClient != null)
                     {
                         var statusOutput = state.Config.Type switch
                         {
-                            VPNServerType.OPENVPN => GetOpenVpnStatus(state.SshClient),
-                            VPNServerType.WIREGUARD => GetWireGuardStatus(state.SshClient),
+                            VPNServerType.OPENVPN => await GetOpenVpnStatus(state.SshClient!),
+                            VPNServerType.WIREGUARD => await GetWireGuardStatus(state.SshClient!),
+                            VPNServerType.XUI => await GetXUIStatus(state.HttpClient!),
                             _ => throw new ArgumentException(nameof(state.Config.Type))
                         };
                         var clientThroughput = state.Config.Type switch
                         {
                             VPNServerType.OPENVPN => ParseStatusAndCalculateThroughputOVPN(statusOutput, state),
                             VPNServerType.WIREGUARD => ParseStatusAndCalculateThroughputWRG(statusOutput, state),
+                            VPNServerType.XUI => ParseStatusAndCalculateThroughputXUI(statusOutput, state),
                             _ => throw new ArgumentException(nameof(state.Config.Type))
                         };
                         await InsertDataToDb(clientThroughput, config);
@@ -133,16 +146,22 @@ namespace RemoteOpenVPNTrafficMonitor
                 }
             }
         }
-        private string GetOpenVpnStatus(SshClient sshClient)
+        private async Task<string> GetOpenVpnStatus(SshClient sshClient)
         {
             using var command = sshClient.RunCommand("cat /var/log/openvpn-status.log");
             return command.Result;
         }
 
-        private string GetWireGuardStatus(SshClient sshClient)
+        private async Task<string> GetWireGuardStatus(SshClient sshClient)
         {
             using var command = sshClient.RunCommand("sudo wg show all dump | tail -n +2");
             return command.Result;
+        }
+        private async Task<string> GetXUIStatus(HttpClient httpClient)
+        {
+            using var response = await httpClient.GetAsync("panel/api/inbounds/list");
+            response.EnsureSuccessStatusCode();
+            return await response.Content.ReadAsStringAsync();
         }
 
         private Dictionary<string, (string ipAddr, double throughputIn, double throughputOut)> ParseStatusAndCalculateThroughputWRG(string statusOutput, ServerMonitoringState state)
@@ -269,6 +288,63 @@ namespace RemoteOpenVPNTrafficMonitor
             return results;
         }
 
+        private Dictionary<string, (string ipAddr, double throughputIn, double throughputOut)>
+    ParseStatusAndCalculateThroughputXUI(string statusOutput, ServerMonitoringState state)
+        {
+            var options = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+            var result = JsonSerializer.Deserialize<XuiResponse>(statusOutput, options);
+
+            var results = new Dictionary<string, (string, double, double)>();
+            var currentTime = DateTime.UtcNow;
+            if (result == null) return results;
+            foreach (Inbound inbound in result.Obj)
+            {
+
+                string clientName = inbound.Remark;
+                string ipAddr = inbound.Id.ToString(); // Default 3x-ui does not expose client IPs.
+                long bytesIn = inbound.Up;
+                long bytesOut = inbound.Down;
+                string clientKey = clientName;
+
+                if (state.PreviousReadings.TryGetValue(clientKey, out ClientTrafficData previous))
+                {
+                    double timeDiff = (currentTime - previous.Timestamp).TotalSeconds;
+
+                    if (timeDiff > 0)
+                    {
+                        long bytesInDiff = bytesIn;
+                        long bytesOutDiff = bytesOut;
+
+                        if (bytesIn < previous.BytesIn || bytesOut < previous.BytesOut)
+                        {
+                            _logger.LogWarning($"Counter reset detected for {clientName} on server {state.Config.Name}. Using absolute values.");
+                        }
+                        else
+                        {
+                            bytesInDiff = bytesIn - previous.BytesIn;
+                            bytesOutDiff = bytesOut - previous.BytesOut;
+                        }
+
+                        double throughputIn = bytesInDiff / timeDiff;
+                        double throughputOut = bytesOutDiff / timeDiff;
+
+                        results[clientName] = (ipAddr, throughputIn, throughputOut);
+                    }
+                }
+
+                state.PreviousReadings[clientKey] = new ClientTrafficData
+                {
+                    BytesIn = bytesIn,
+                    BytesOut = bytesOut,
+                    Timestamp = currentTime,
+                    IpAddress = ipAddr
+                };
+            }
+
+            CleanupOldEntries(state);
+
+            return results;
+        }
         private void CleanupOldEntries(ServerMonitoringState state)
         {
             var cutoffTime = DateTime.UtcNow.AddHours(-1);
@@ -325,7 +401,7 @@ namespace RemoteOpenVPNTrafficMonitor
                     ip_addr VARCHAR(15) NOT NULL,
                     client_upload BIGINT NOT NULL CHECK (client_upload >= 0),
                     client_download BIGINT NOT NULL CHECK (client_download >= 0),
-                    measured_at TIMESTAMP DEFAULT NOW()
+                    measured_at TIMESTAMPTZ  DEFAULT NOW()
                 )", conn);
 
             await createTableCommand.ExecuteNonQueryAsync();
@@ -375,11 +451,38 @@ namespace RemoteOpenVPNTrafficMonitor
             }
         }
 
+        private async Task SetupHttpClient(ServerMonitoringState state)
+        {
+            var config = state.Config;
+
+            var handler = new HttpClientHandler
+            {
+                CookieContainer = new CookieContainer(),
+            };
+
+            state.HttpClient = new HttpClient(handler);
+            state.HttpClient.BaseAddress = new Uri($"https://{config.Address}:{config.Port}{config.XUIBaseUrl}");
+
+            state.HttpClient.DefaultRequestHeaders.Accept.Add(
+                new MediaTypeWithQualityHeaderValue("application/json"));
+
+            var loginData = new FormUrlEncodedContent(new[]
+            {
+                new KeyValuePair<string, string>("username", config.Username),
+                new KeyValuePair<string, string>("password", config.Password)
+            });
+            _logger.LogInformation(state.HttpClient.BaseAddress.OriginalString);
+            var loginResponse = await state.HttpClient.PostAsync("login", loginData);
+            loginResponse.EnsureSuccessStatusCode();
+        }
+
+
         // Helper classes for server state management
         private class ServerMonitoringState
         {
             public VPNServerConfig Config { get; set; } = null!;
             public SshClient? SshClient { get; set; }
+            public HttpClient? HttpClient { get; set; }
             public ConcurrentDictionary<string, ClientTrafficData> PreviousReadings { get; set; } = null!;
         }
 
